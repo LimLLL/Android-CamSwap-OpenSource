@@ -168,6 +168,9 @@ public final class Camera2SessionHook {
      * the new session.
      */
     private volatile CameraDevice activeCameraDevice;
+    /** Added to camera timestamps once the camera clock is found to run behind delivered frames. */
+    private volatile long realTimestampOffsetNs;
+    private volatile boolean loggedFirstRealForward;
     // YUV delivery statistics, logged every few seconds by the pump thread.
     private int yuvPumpWrittenSinceLog;
     private volatile int yuvRelayForwardedSinceLog;
@@ -296,6 +299,7 @@ public final class Camera2SessionHook {
 
     /** Previews and YUV relays check the switch on every frame; only audio needs updating here. */
     public void onCameraSourceChanged() {
+        loggedFirstRealForward = false;
         playerManager.updateCameraSourceVolume();
         LogUtil.log("【CS】Camera2 来源切换为" + (SwitchablePreview.useOriginalCamera() ? "原始相机" : "虚拟视频")
                 + " (预览桥接 " + previewByOutput.size() + " 个, YUV 转发 " + yuvRelayByReader.size() + " 个)");
@@ -357,19 +361,25 @@ public final class Camera2SessionHook {
         if (isReleasing || appReader == null || !appReader.isValid()) {
             return;
         }
+        long timestampNs = alignRealTimestamp(frame.getTimestamp());
+        if (timestampNs < 0L) {
+            return;
+        }
         try {
             ImageWriter writer = obtainImageWriter(appReader);
             synchronized (writer) {
                 Image out = writer.dequeueInputImage();
                 try {
                     YuvSourceRelay.copyFrame(frame, out);
-                    long timestampNs = frame.getTimestamp();
-                    // Keeps later fake frames after this one once the source switches back.
-                    lastMonotonicPtsNs.accumulateAndGet(timestampNs, Math::max);
                     out.setTimestamp(timestampNs);
                     writer.queueInputImage(out);
                     out = null;
                     yuvRelayForwardedSinceLog++;
+                    if (!loggedFirstRealForward) {
+                        loggedFirstRealForward = true;
+                        LogUtil.log("【CS】已向应用转发首帧真实画面 (相机时间戳 " + frame.getTimestamp()
+                                + ", 投递时间戳 " + timestampNs + ")");
+                    }
                 } finally {
                     if (out != null) {
                         out.close();
@@ -385,6 +395,32 @@ public final class Camera2SessionHook {
         }
     }
 
+    /**
+     * Keeps delivered timestamps increasing across source switches; Chromium drops frames
+     * older than the last one it received, so real frames after fake ones were all discarded.
+     * A small lag is the camera's own latency and is waited out, keeping timestamps equal to
+     * the capture results; a large gap means the camera uses another clock (e.g. one that
+     * excludes deep sleep) and is bridged with a fixed offset.
+     *
+     * @return the timestamp to deliver, or -1 to drop this frame
+     */
+    private long alignRealTimestamp(long cameraTimestampNs) {
+        long last = lastMonotonicPtsNs.get();
+        long aligned = cameraTimestampNs + realTimestampOffsetNs;
+        if (aligned <= last) {
+            if (last - aligned < 1_000_000_000L) {
+                return -1L;
+            }
+            realTimestampOffsetNs = last + 33_333_333L - cameraTimestampNs;
+            aligned = cameraTimestampNs + realTimestampOffsetNs;
+            LogUtil.log("【CS】相机时间戳比已投递帧早 " + (last - cameraTimestampNs) / 1_000_000L
+                    + "ms，改用偏移对齐");
+        }
+        // Later fake frames continue after this one.
+        lastMonotonicPtsNs.accumulateAndGet(aligned, Math::max);
+        return aligned;
+    }
+
     private ImageWriter obtainImageWriter(Surface surface) {
         return imageWriterMap.computeIfAbsent(surface, s -> ImageWriter.newInstance(s, 2));
     }
@@ -394,6 +430,7 @@ public final class Camera2SessionHook {
      * them any more, i.e. on device open/close; players must already be released.
      */
     private void releaseCameraBridges() {
+        realTimestampOffsetNs = 0L;
         List<SwitchablePreview> previews = new ArrayList<>(new LinkedHashSet<>(previewByOutput.values()));
         previewByOutput.clear();
         previewByNativeHandle.clear();
