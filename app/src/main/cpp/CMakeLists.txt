@@ -33,6 +33,8 @@ target_link_libraries(camswap-native-hook
     log
     dl
     android
+    # ANativeWindow_setBuffersTransform (buffer_transform.cpp) lives here, API 26+.
+    nativewindow
     OpenSLES
 )
 
