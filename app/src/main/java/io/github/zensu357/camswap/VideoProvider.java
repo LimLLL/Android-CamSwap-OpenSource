@@ -86,7 +86,9 @@ public class VideoProvider extends ContentProvider {
         }
         String lastPathSegment = uri.getLastPathSegment();
         if (IpcContract.PATH_CONFIG.equals(lastPathSegment)) {
-            configManager.reload();
+            // Not reload(): its 1 s debounce served stale config right after a save, so the
+            // overlay toggle re-wrote the old value and target apps flipped back and forth.
+            configManager.forceReload();
             // If configData is still empty after reload, try force reload once more
             org.json.JSONObject data = configManager.getConfigData();
             if (data == null || data.length() == 0) {
@@ -146,7 +148,7 @@ public class VideoProvider extends ContentProvider {
         if (!isCallerAllowed()) {
             throw new FileNotFoundException("Caller not allowed");
         }
-        configManager.reload();
+        configManager.forceReload();
 
         String lastSeg = uri.getLastPathSegment();
 
@@ -282,7 +284,8 @@ public class VideoProvider extends ContentProvider {
             denied.putBoolean(IpcContract.EXTRA_CHANGED, false);
             return denied;
         }
-        configManager.reload();
+        // Read-modify-write below must start from the latest saved config.
+        configManager.forceReload();
         boolean changed = false;
 
         try {

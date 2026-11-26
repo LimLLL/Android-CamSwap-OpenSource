@@ -46,7 +46,8 @@ public final class MediaSourceDescriptor {
 
     public boolean isValid() {
         if (type == Type.LOCAL_FILE) {
-            return localPath != null && !localPath.isEmpty();
+            // Apps without storage access read the video through the provider and have no path.
+            return useProviderPfd || (localPath != null && !localPath.isEmpty());
         } else {
             return streamUrl != null && !streamUrl.isEmpty();
         }

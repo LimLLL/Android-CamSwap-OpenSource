@@ -153,29 +153,20 @@ public class Camera2Handler implements ICameraHandler {
                         }
                     }
 
-                    boolean isSurfaceTexture = HookMain.camera2Hook.isSurfaceTextureSurface(targetSurface);
-                    boolean isJpeg = HookMain.camera2Hook.isJpegReaderSurface(targetSurface);
-                    boolean isYuv = HookMain.camera2Hook.isYuvReaderSurface(targetSurface);
-
-                    if (isSurfaceTexture || (!isJpeg && !HookMain.camera2Hook.isTrackedReaderSurface(targetSurface))) {
-                        // Resolve the camera target first: it may create the preview bridge that
-                        // playback started by rememberPreviewSurface has to render into.
-                        Surface vSurface = HookMain.camera2Hook.getVirtualSurfaceFor(targetSurface);
-                        if (vSurface == null || !vSurface.isValid()) {
-                            vSurface = HookMain.camera2Hook.getFallbackRequestTarget();
-                        }
-                        HookMain.camera2Hook.rememberPreviewSurface(targetSurface);
-                        LogUtil.log("【CS】【addTarget】重定向主预览目标 -> 原始Surface: " + targetSurface
-                                + " -> 虚拟Surface: " + vSurface);
-                        args[0] = vSurface;
-                    } else if (isYuv) {
-                        HookMain.camera2Hook.pumpDirectYuvFrame(targetSurface);
-                        Surface vSurface = HookMain.camera2Hook.getYuvRequestTarget(targetSurface);
-                        LogUtil.log("【CS】【addTarget】重定向 YUV Reader 目标 -> 原始Surface: " + targetSurface
-                                + " -> 虚拟Surface: " + vSurface);
-                        args[0] = vSurface;
-                    } else {
+                    // Same resolver as the session rewrite, so requests only target configured outputs.
+                    Surface vSurface = HookMain.camera2Hook.resolveCameraTarget(targetSurface);
+                    if (vSurface == targetSurface) {
                         LogUtil.log("【CS】【addTarget】保留真实辅助流/JPEG目标: " + targetSurface);
+                    } else {
+                        if (HookMain.camera2Hook.isYuvReaderSurface(targetSurface)) {
+                            HookMain.camera2Hook.pumpDirectYuvFrame(targetSurface);
+                        } else {
+                            // After resolving, so playback renders into the preview bridge.
+                            HookMain.camera2Hook.rememberPreviewSurface(targetSurface);
+                        }
+                        LogUtil.log("【CS】【addTarget】重定向目标 -> 原始Surface: " + targetSurface
+                                + " -> 相机端Surface: " + vSurface);
+                        args[0] = vSurface;
                     }
                 } catch (Throwable t) {
                     LogUtil.e("【CS】【addTarget】执行异常: " + t.getMessage(), t);
