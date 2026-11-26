@@ -379,6 +379,8 @@ public final class MediaPlayerManager {
             if (player.isPlaying())
                 player.stop();
             player.reset();
+            // reset() clears looping; without it short clips freeze after one pass.
+            player.setLooping(true);
             if (renderer != null && renderer.isInitialized()) {
                 player.setSurface(renderer.getInputSurface());
             }

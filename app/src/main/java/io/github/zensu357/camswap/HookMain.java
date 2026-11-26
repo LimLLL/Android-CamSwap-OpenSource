@@ -148,8 +148,8 @@ public class HookMain {
 
                 @Override
                 public void onRotationChanged(int degrees) {
+                    // The YUV pump reads the rotation per frame, so the decoder keeps running.
                     playerManager.updateRotation(degrees);
-                    camera2Hook.restartYuvDecoderForSourceChange();
                 }
             });
             configWatcher.init(context);
@@ -434,8 +434,12 @@ public class HookMain {
         }
 
         ImageReader imageReader = (ImageReader) thisObject;
-        if (SwitchablePreview.useOriginalCamera()) return chain.proceed(args);
         Surface surface = imageReader.getSurface();
+        if (SwitchablePreview.useOriginalCamera()) {
+            Object real = chain.proceed(args);
+            camera2Hook.noteAppYuvAcquire(surface, real);
+            return real;
+        }
         Object result;
         boolean isYuvReader = false;
         try {
@@ -467,6 +471,7 @@ public class HookMain {
             }
         }
 
+        camera2Hook.noteAppYuvAcquire(surface, result);
         return maybeReplaceJpegImage(imageReader, surface, result);
     }
 

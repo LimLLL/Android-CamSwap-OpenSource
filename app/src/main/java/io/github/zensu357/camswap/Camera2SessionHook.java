@@ -162,6 +162,18 @@ public final class Camera2SessionHook {
     private HandlerThread yuvRelayThread;
     private Handler yuvRelayHandler;
     private volatile long lastYuvRelayErrorLogMs = 0L;
+    /**
+     * Device whose session the shared state belongs to. Apps such as Chromium open the next
+     * device before the previous one reports onClosed; that late callback must not tear down
+     * the new session.
+     */
+    private volatile CameraDevice activeCameraDevice;
+    // YUV delivery statistics, logged every few seconds by the pump thread.
+    private int yuvPumpWrittenSinceLog;
+    private volatile int yuvRelayForwardedSinceLog;
+    private long lastYuvPumpStatsLogMs;
+    private final Set<Surface> loggedAppYuvAcquires = Collections
+            .newSetFromMap(new ConcurrentHashMap<Surface, Boolean>());
 
     /** Check if a surface is one the camera writes to on CamSwap's behalf. */
     public synchronized boolean isVirtualSurface(Surface surface) {
@@ -357,6 +369,7 @@ public final class Camera2SessionHook {
                     out.setTimestamp(timestampNs);
                     writer.queueInputImage(out);
                     out = null;
+                    yuvRelayForwardedSinceLog++;
                 } finally {
                     if (out != null) {
                         out.close();
@@ -509,6 +522,8 @@ public final class Camera2SessionHook {
             Api101Runtime.requireModule().hook(m).intercept(chain -> {
                 Object[] args = toArgs(chain.getArgs());
                 try {
+                    activeCameraDevice = (CameraDevice) args[0];
+                    loggedAppYuvAcquires.clear();
                     isReleasing = false;
                     needRecreate = true;
                     createVirtualSurface();
@@ -562,6 +577,11 @@ public final class Camera2SessionHook {
             Api101Runtime.requireModule().hook(m).intercept(chain -> {
                 Object[] args = toArgs(chain.getArgs());
                 try {
+                    if (!isActiveDevice(args[0])) {
+                        LogUtil.log("【CS】忽略旧相机的 onClosed，当前会话继续");
+                        return chain.proceed(args);
+                    }
+                    activeCameraDevice = null;
                     LogUtil.log("【CS】相机关闭 onClosed，释放播放器资源");
                     setBypassCurrentSession(false);
                     yuvBridgeSessionReady = false;
@@ -600,6 +620,11 @@ public final class Camera2SessionHook {
             Api101Runtime.requireModule().hook(m).intercept(chain -> {
                 Object[] args = toArgs(chain.getArgs());
                 try {
+                    if (!isActiveDevice(args[0])) {
+                        LogUtil.log("【CS】忽略旧相机的 onDisconnected，当前会话继续");
+                        return chain.proceed(args);
+                    }
+                    activeCameraDevice = null;
                     LogUtil.log("【CS】相机断开 onDisconnected，释放播放器资源");
                     setBypassCurrentSession(false);
                     yuvBridgeSessionReady = false;
@@ -615,6 +640,42 @@ public final class Camera2SessionHook {
         } catch (Throwable t) {
             LogUtil.log("【CS】Hook onDisconnected 失败: " + t);
         }
+    }
+
+    /** Unknown when onOpened was not intercepted; then keep the old always-release behaviour. */
+    private boolean isActiveDevice(Object device) {
+        CameraDevice active = activeCameraDevice;
+        return active == null || active == device;
+    }
+
+    /** Logs the first frame an app takes from each YUV reader CamSwap feeds. */
+    public void noteAppYuvAcquire(Surface reader, Object result) {
+        if (!(result instanceof Image) || reader == null || !sessionKeptYuvSurfaces.contains(reader)
+                || !loggedAppYuvAcquires.add(reader)) {
+            return;
+        }
+        Image image = (Image) result;
+        LogUtil.log("【CS】应用已取到首帧 YUV: " + image.getWidth() + "x" + image.getHeight()
+                + " fmt=" + image.getFormat() + " 来源=" + (SwitchablePreview.useOriginalCamera() ? "原始相机" : "虚拟视频"));
+    }
+
+    /** Called on the pump thread after each round; logs at most every 5 s. */
+    private void recordYuvPumpRound(int written) {
+        if (sessionKeptYuvSurfaces.isEmpty()) {
+            return;
+        }
+        yuvPumpWrittenSinceLog += written;
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastYuvPumpStatsLogMs < 5000L) {
+            return;
+        }
+        lastYuvPumpStatsLogMs = now;
+        MediaCodecYuvDecoder dec = yuvDecoder;
+        LogUtil.log("【CS】YUV 推帧统计(5s): 虚拟帧 " + yuvPumpWrittenSinceLog + ", 真实帧转发 " + yuvRelayForwardedSinceLog
+                + ", 目标 Reader " + sessionKeptYuvSurfaces.size()
+                + ", 解码器" + (dec == null ? "未运行" : (dec.acquireLatestFrame() == null ? "无帧" : "有帧")));
+        yuvPumpWrittenSinceLog = 0;
+        yuvRelayForwardedSinceLog = 0;
     }
 
     /** Start video playback on all current surfaces. */
@@ -2653,14 +2714,16 @@ public final class Camera2SessionHook {
                 return;
             }
             long startMs = SystemClock.elapsedRealtime();
+            int written = 0;
             try {
                 for (Surface surface : sessionKeptYuvSurfaces) {
-                    if (surface != null && surface.isValid()) {
-                        pumpDirectYuvFrame(surface);
+                    if (surface != null && surface.isValid() && pumpDirectYuvFrame(surface)) {
+                        written++;
                     }
                 }
             } catch (Throwable ignored) {
             }
+            recordYuvPumpRound(written);
             long elapsed = SystemClock.elapsedRealtime() - startMs;
             long delay = Math.max(10L, 33L - elapsed);
             if (whatsappYuvPumpHandler != null && isYuvPumperRunning) {
