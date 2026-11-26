@@ -133,7 +133,10 @@ public class HookMain {
             configWatcher = new ConfigWatcher(new ConfigWatcher.Callback() {
                 @Override
                 public void onMediaSourceChanged() {
-                    if (!SwitchablePreview.useOriginalCamera()) playerManager.restartAll();
+                    // Also in original mode: Camera2 players render off-screen there, so switching
+                    // back shows the newly selected media right away.
+                    playerManager.restartAll();
+                    playerManager.updateCameraSourceVolume();
                     camera2Hook.restartYuvDecoderForSourceChange();
                 }
 

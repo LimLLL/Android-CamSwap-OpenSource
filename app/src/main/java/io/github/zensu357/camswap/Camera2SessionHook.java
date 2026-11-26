@@ -149,9 +149,26 @@ public final class Camera2SessionHook {
         }
     };
 
-    /** Check if a surface is one of CamSwap's virtual surfaces. */
+    // App preview outputs taken over by a SwitchablePreview, keyed by Surface and native handle
+    // because the app may pass different Java wrappers of the same native Surface.
+    private final Map<Surface, SwitchablePreview> previewByOutput = new ConcurrentHashMap<>();
+    private final Map<Long, SwitchablePreview> previewByNativeHandle = new ConcurrentHashMap<>();
+    private final Set<Surface> previewCameraSurfaces = Collections
+            .newSetFromMap(new ConcurrentHashMap<Surface, Boolean>());
+    // App YUV readers whose camera stream goes through a YuvSourceRelay, keyed by the app's Surface.
+    private final Map<Surface, YuvSourceRelay> yuvRelayByReader = new ConcurrentHashMap<>();
+    private final Set<Surface> yuvRelaySurfaces = Collections
+            .newSetFromMap(new ConcurrentHashMap<Surface, Boolean>());
+    private HandlerThread yuvRelayThread;
+    private Handler yuvRelayHandler;
+    private volatile long lastYuvRelayErrorLogMs = 0L;
+    /** Camera-side Surface of the session's main preview. */
+    private volatile Surface primaryCameraTarget;
+
+    /** Check if a surface is one the camera writes to on CamSwap's behalf. */
     public synchronized boolean isVirtualSurface(Surface surface) {
-        return surface != null && virtualSurfaces.contains(surface);
+        return surface != null && (virtualSurfaces.contains(surface)
+                || previewCameraSurfaces.contains(surface) || yuvRelaySurfaces.contains(surface));
     }
 
     /** Public accessor for Camera2Handler to check/redirect surfaces. */
@@ -180,12 +197,218 @@ public final class Camera2SessionHook {
             if (!originalToVirtualMap.isEmpty() || !originalNativeToVirtualMap.isEmpty()) {
                 return null;
             }
-            // 若会话尚未建立或无映射且该 Surface 是明显的预览 SurfaceTexture，才兜底生成 virtualSurface
+            // 会话尚未建立时（先 addTarget 后建会话），预先为明显的预览 Surface 建立桥接，
+            // 之后会话改写会复用同一个相机目标
             if (isSurfaceTextureSurface(originalSurface)) {
-                return getVirtualSurface();
+                return getCameraTargetSurface(originalSurface);
             }
         }
         return null;
+    }
+
+    /** Request target for app Surfaces that the current session does not contain. */
+    public Surface getFallbackRequestTarget() {
+        Surface primary = primaryCameraTarget;
+        return primary != null && primary.isValid() ? primary : getVirtualSurface();
+    }
+
+    /**
+     * Returns the Surface the camera writes to for an app preview output, creating a
+     * {@link SwitchablePreview} on first use, so session outputs and request targets resolve to
+     * the same Surface. If the bridge cannot be built the camera writes to a virtual drain,
+     * which keeps real frames away from the app while virtual output is selected.
+     */
+    synchronized Surface getCameraTargetSurface(Surface output) {
+        if (output == null) {
+            return null;
+        }
+        if (isVirtualSurface(output)) {
+            return output;
+        }
+        SwitchablePreview preview = findPreview(output);
+        if (preview != null) {
+            Surface cameraSurface = preview.getCameraSurface();
+            if (cameraSurface != null && cameraSurface.isValid()) {
+                return cameraSurface;
+            }
+        }
+        Surface mapped = findMappedTarget(output);
+        if (mapped != null) {
+            return mapped;
+        }
+        Surface target;
+        preview = SwitchablePreview.create(output);
+        if (preview != null) {
+            target = preview.getCameraSurface();
+            previewByOutput.put(output, preview);
+            long handle = getSurfaceNativeHandle(output);
+            if (handle != 0L) {
+                previewByNativeHandle.put(handle, preview);
+            }
+            previewCameraSurfaces.add(target);
+        } else {
+            target = createVirtualSurface(0);
+            LogUtil.log("【CS】预览桥接不可用，该预览无法切换到原始相机: " + output);
+        }
+        mapToCameraTarget(output, target);
+        return target;
+    }
+
+    private SwitchablePreview findPreview(Surface output) {
+        if (output == null) {
+            return null;
+        }
+        SwitchablePreview preview = previewByOutput.get(output);
+        if (preview == null) {
+            long handle = getSurfaceNativeHandle(output);
+            if (handle != 0L) {
+                preview = previewByNativeHandle.get(handle);
+            }
+        }
+        return preview;
+    }
+
+    private Surface findMappedTarget(Surface output) {
+        Surface mapped = originalToVirtualMap.get(output);
+        if (mapped == null) {
+            long handle = getSurfaceNativeHandle(output);
+            if (handle != 0L) {
+                mapped = originalNativeToVirtualMap.get(handle);
+            }
+        }
+        return mapped != null && mapped.isValid() ? mapped : null;
+    }
+
+    private void mapToCameraTarget(Surface output, Surface target) {
+        originalToVirtualMap.put(output, target);
+        long handle = getSurfaceNativeHandle(output);
+        if (handle != 0L) {
+            originalNativeToVirtualMap.put(handle, target);
+        }
+    }
+
+    /** Where the media player should render for an app preview output. */
+    private Surface mediaOutputSurface(Surface output) {
+        SwitchablePreview preview = findPreview(output);
+        Surface media = preview != null ? preview.getMediaSurface() : null;
+        return media != null ? media : output;
+    }
+
+    /** Previews and YUV relays check the switch on every frame; only audio needs updating here. */
+    public void onCameraSourceChanged() {
+        playerManager.updateCameraSourceVolume();
+        LogUtil.log("【CS】Camera2 来源切换为" + (SwitchablePreview.useOriginalCamera() ? "原始相机" : "虚拟视频")
+                + " (预览桥接 " + previewByOutput.size() + " 个, YUV 转发 " + yuvRelayByReader.size() + " 个)");
+    }
+
+    /**
+     * Camera target for an app YUV reader: a relay with the reader's size so the original
+     * camera can pass real frames through, or a virtual drain if the size is unknown.
+     */
+    private Surface createYuvCameraTarget(Surface appReader, int virtualIndex) {
+        YuvSourceRelay relay = yuvRelayByReader.get(appReader);
+        if (relay != null && relay.getSurface().isValid()) {
+            return relay.getSurface();
+        }
+        int[] size = surfaceSizeMap.get(appReader);
+        if (size == null) {
+            long handle = getSurfaceNativeHandle(appReader);
+            if (handle != 0L) {
+                size = surfaceNativeSizeMap.get(handle);
+            }
+        }
+        if (size != null && size.length >= 2 && size[0] > 0 && size[1] > 0) {
+            try {
+                Handler handler = ensureYuvRelayHandler();
+                enterInternalBridgeCreation();
+                try {
+                    relay = new YuvSourceRelay(size[0], size[1], handler,
+                            frame -> forwardRealYuvFrame(appReader, frame));
+                } finally {
+                    exitInternalBridgeCreation();
+                }
+                yuvRelaySurfaces.add(relay.getSurface());
+                yuvRelayByReader.put(appReader, relay);
+                LogUtil.log("【CS】YUV Reader 改由转发器接收相机帧 " + size[0] + "x" + size[1] + ": " + appReader);
+                return relay.getSurface();
+            } catch (Throwable t) {
+                LogUtil.log("【CS】创建 YUV 转发器失败，回退虚拟 Surface: " + t);
+            }
+        }
+        return createVirtualSurface(virtualIndex);
+    }
+
+    private synchronized Handler ensureYuvRelayHandler() {
+        if (yuvRelayThread == null || !yuvRelayThread.isAlive()) {
+            yuvRelayThread = new HandlerThread("CS-YuvRelay");
+            yuvRelayThread.start();
+            yuvRelayHandler = new Handler(yuvRelayThread.getLooper());
+        }
+        return yuvRelayHandler;
+    }
+
+    /** Copies a real camera frame into the app's reader through the writer the fake pumps also use. */
+    private void forwardRealYuvFrame(Surface appReader, Image frame) {
+        if (isReleasing || appReader == null || !appReader.isValid()) {
+            return;
+        }
+        try {
+            ImageWriter writer = obtainImageWriter(appReader);
+            synchronized (writer) {
+                Image out = writer.dequeueInputImage();
+                try {
+                    YuvSourceRelay.copyFrame(frame, out);
+                    long timestampNs = frame.getTimestamp();
+                    // Keeps later fake frames after this one once the source switches back.
+                    lastMonotonicPtsNs.accumulateAndGet(timestampNs, Math::max);
+                    out.setTimestamp(timestampNs);
+                    writer.queueInputImage(out);
+                    out = null;
+                } finally {
+                    if (out != null) {
+                        out.close();
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            long now = SystemClock.elapsedRealtime();
+            if (now - lastYuvRelayErrorLogMs > 5000L) {
+                lastYuvRelayErrorLogMs = now;
+                LogUtil.log("【CS】转发真实 YUV 帧失败: " + t);
+            }
+        }
+    }
+
+    private ImageWriter obtainImageWriter(Surface surface) {
+        return imageWriterMap.computeIfAbsent(surface, s -> ImageWriter.newInstance(s, 2));
+    }
+
+    /**
+     * Disconnects preview bridges and YUV relays. Only valid when no camera device streams into
+     * them any more, i.e. on device open/close; players must already be released.
+     */
+    private void releaseCameraBridges() {
+        primaryCameraTarget = null;
+        List<SwitchablePreview> previews = new ArrayList<>(new LinkedHashSet<>(previewByOutput.values()));
+        previewByOutput.clear();
+        previewByNativeHandle.clear();
+        previewCameraSurfaces.clear();
+        for (SwitchablePreview preview : previews) {
+            preview.release();
+        }
+        List<YuvSourceRelay> relays = new ArrayList<>(yuvRelayByReader.values());
+        yuvRelayByReader.clear();
+        yuvRelaySurfaces.clear();
+        for (YuvSourceRelay relay : relays) {
+            relay.release();
+        }
+        synchronized (this) {
+            if (yuvRelayThread != null) {
+                yuvRelayThread.quitSafely();
+                yuvRelayThread = null;
+                yuvRelayHandler = null;
+            }
+        }
     }
 
     /** Mark virtual surface for recreation on next session creation. */
@@ -298,6 +521,7 @@ public final class Camera2SessionHook {
                     needRecreate = true;
                     createVirtualSurface();
                     playerManager.releaseCamera2Resources();
+                    releaseCameraBridges();
                     releaseImageWriters(false);
                     previewSurface1 = null;
                     readerSurface1 = null;
@@ -351,6 +575,7 @@ public final class Camera2SessionHook {
                     yuvBridgeSessionReady = false;
                     stopAllWhatsAppYuvPumps();
                     playerManager.releaseCamera2Resources();
+                    releaseCameraBridges();
                     releaseImageWriters();
                 } catch (Throwable t) {
                     LogUtil.log("【CS】onClosed before 异常: " + t);
@@ -388,6 +613,7 @@ public final class Camera2SessionHook {
                     yuvBridgeSessionReady = false;
                     stopAllWhatsAppYuvPumps();
                     playerManager.releaseCamera2Resources();
+                    releaseCameraBridges();
                     releaseImageWriters();
                 } catch (Throwable t) {
                     LogUtil.log("【CS】onDisconnected before 异常: " + t);
@@ -407,6 +633,12 @@ public final class Camera2SessionHook {
                     + " [preview=" + previewSurface + ", preview1=" + previewSurface1
                     + ", reader=" + readerSurface + ", reader1=" + readerSurface1 + "]");
             pendingPlayback = true;
+            // YUV-only sessions (e.g. Chromium) have no player target; fake frames come from the
+            // YUV decoder and the continuous pump alone.
+            if (!sessionKeptYuvSurfaces.isEmpty()) {
+                markYuvBridgeSessionReadyIfPossible();
+                startContinuousYuvPumper();
+            }
             return;
         }
         // Skip redundant init when surfaces haven't changed since last call
@@ -429,7 +661,7 @@ public final class Camera2SessionHook {
         lastInitPreview1 = previewSurface1;
         pendingPlayback = false;
         playerManager.initCamera2Players(readerSurface, readerSurface1,
-                previewSurface, previewSurface1);
+                mediaOutputSurface(previewSurface), mediaOutputSurface(previewSurface1));
         markYuvBridgeSessionReadyIfPossible();
         startContinuousYuvPumper();
 
@@ -565,7 +797,8 @@ public final class Camera2SessionHook {
     }
 
     public boolean isInternalFakeYuvReaderSurface(Surface surface) {
-        return surface != null && internalFakeYuvReaderSurfaces.contains(surface);
+        return surface != null && (internalFakeYuvReaderSurfaces.contains(surface)
+                || yuvRelaySurfaces.contains(surface));
     }
 
     private void enterInternalBridgeCreation() {
@@ -775,32 +1008,33 @@ public final class Camera2SessionHook {
     private List<Surface> rewriteSessionSurfaces(List<?> outputs, String packageName) {
         LinkedHashSet<Surface> rewritten = new LinkedHashSet<>();
         sessionKeptYuvSurfaces.clear();
-        int virtualIndex = 0;
+        boolean previewAssigned = false;
+        // virtual[0] is reserved for the main preview's fallback drain.
+        int virtualIndex = 1;
+        primaryCameraTarget = null;
         if (outputs != null) {
             for (Object output : outputs) {
                 if (output instanceof Surface) {
                     Surface surface = (Surface) output;
                     boolean isJpeg = isJpegReaderSurface(surface);
                     boolean isYuv = isYuvReaderSurface(surface) || shouldKeepYuvReaderSurfaceForPackage(surface, packageName);
-                    boolean isPreview = (virtualIndex == 0 && !isJpeg);
 
-                    if (isPreview) {
-                        Surface vSurface = createVirtualSurface(virtualIndex++);
-                        originalToVirtualMap.put(surface, vSurface);
-                        long handle = getSurfaceNativeHandle(surface);
-                        if (handle != 0L) originalNativeToVirtualMap.put(handle, vSurface);
-                        rememberPreviewSurface(surface);
-                        rewritten.add(vSurface);
-                        LogUtil.log("【CS】SessionSurfaces 替换主预览 Surface -> virtual[0]: " + surface);
+                    // YUV readers are never the preview: sessions with only a YUV reader (Chromium
+                    // browsers, WebRTC) must still get frames pumped into it.
+                    if (!previewAssigned && !isJpeg && !isYuv) {
+                        previewAssigned = true;
+                        Surface target = assignPreviewTarget(surface);
+                        rewritten.add(target);
+                        LogUtil.log("【CS】SessionSurfaces 替换主预览 Surface -> " + target + ": " + surface);
                     } else if (isYuv) {
-                        Surface vSurface = createVirtualSurface(virtualIndex++);
-                        originalToVirtualMap.put(surface, vSurface);
-                        long handle = getSurfaceNativeHandle(surface);
-                        if (handle != 0L) originalNativeToVirtualMap.put(handle, vSurface);
+                        Surface vSurface = assignYuvTarget(surface, virtualIndex++);
                         rememberReaderPlaybackSurface(surface);
                         sessionKeptYuvSurfaces.add(surface);
                         rewritten.add(vSurface);
-                        LogUtil.log("【CS】SessionSurfaces [方案一替身置换] 替换 YUV Reader Surface -> virtual[" + (virtualIndex - 1) + "]: " + surface);
+                        LogUtil.log("【CS】SessionSurfaces [方案一替身置换] 替换 YUV Reader Surface -> " + vSurface + ": " + surface);
+                    } else if (findPreview(surface) != null) {
+                        rewritten.add(assignBridgedTarget(surface));
+                        LogUtil.log("【CS】SessionSurfaces 复用已建立的预览桥接: " + surface);
                     } else {
                         rewritten.add(surface);
                         LogUtil.log("【CS】SessionSurfaces 保留真实辅助/JPEG Surface: " + surface);
@@ -812,6 +1046,55 @@ public final class Camera2SessionHook {
             rewritten.add(createVirtualSurface(0));
         }
         return new ArrayList<>(rewritten);
+    }
+
+    /**
+     * Routes the session's main preview output. ImageReaders and deferred outputs cannot be
+     * bridged and keep the previous virtual-drain behaviour.
+     */
+    private Surface assignPreviewTarget(Surface surface) {
+        Surface target = surface == null || isTrackedReaderSurface(surface)
+                ? createVirtualSurface(0) : getCameraTargetSurface(surface);
+        if (surface != null) {
+            mapToCameraTarget(surface, target);
+            // After the bridge exists, so playback renders into the bridge rather than the app Surface.
+            rememberPreviewSurface(surface);
+        }
+        primaryCameraTarget = target;
+        return target;
+    }
+
+    /**
+     * Routes a YUV reader output, reusing a target already created by an addTarget issued
+     * before the session (Chromium builds its request first).
+     */
+    private Surface assignYuvTarget(Surface reader, int virtualIndex) {
+        Surface target = findMappedTarget(reader);
+        if (target == null) {
+            target = createYuvCameraTarget(reader, virtualIndex);
+            mapToCameraTarget(reader, target);
+        }
+        if (primaryCameraTarget == null) {
+            primaryCameraTarget = target;
+        }
+        return target;
+    }
+
+    /** Request target for an app YUV reader, created on demand like {@link #assignYuvTarget}. */
+    public synchronized Surface getYuvRequestTarget(Surface reader) {
+        Surface target = findMappedTarget(reader);
+        if (target == null) {
+            target = createYuvCameraTarget(reader, 1);
+            mapToCameraTarget(reader, target);
+        }
+        return target;
+    }
+
+    /** A later output already bridged by an addTarget issued before the session was created. */
+    private Surface assignBridgedTarget(Surface surface) {
+        Surface target = getCameraTargetSurface(surface);
+        rememberPreviewSurface(surface);
+        return target;
     }
 
     public boolean isSurfaceTextureSurface(Surface surface) {
@@ -827,7 +1110,10 @@ public final class Camera2SessionHook {
     private List<OutputConfiguration> rewriteOutputConfigurations(List<?> outputs, String packageName) {
         List<OutputConfiguration> rewritten = new ArrayList<>();
         sessionKeptYuvSurfaces.clear();
-        int virtualIndex = 0;
+        boolean previewAssigned = false;
+        // virtual[0] is reserved for the main preview's fallback drain.
+        int virtualIndex = 1;
+        primaryCameraTarget = null;
         if (outputs != null) {
             for (Object output : outputs) {
                 if (!(output instanceof OutputConfiguration)) {
@@ -837,29 +1123,22 @@ public final class Camera2SessionHook {
                 Surface originalSurface = config.getSurface();
                 boolean isJpeg = isJpegReaderSurface(originalSurface);
                 boolean isYuv = isYuvReaderSurface(originalSurface) || shouldKeepYuvReaderSurfaceForPackage(originalSurface, packageName);
-                boolean isPreview = (virtualIndex == 0 && !isJpeg);
 
-                if (isPreview) {
-                    Surface vSurface = createVirtualSurface(virtualIndex++);
-                    if (originalSurface != null) {
-                        originalToVirtualMap.put(originalSurface, vSurface);
-                        long handle = getSurfaceNativeHandle(originalSurface);
-                        if (handle != 0L) originalNativeToVirtualMap.put(handle, vSurface);
-                        rememberPreviewSurface(originalSurface);
-                    }
+                // YUV readers are never the preview, see rewriteSessionSurfaces.
+                if (!previewAssigned && !isJpeg && !isYuv) {
+                    previewAssigned = true;
+                    Surface target = assignPreviewTarget(originalSurface);
+                    rewritten.add(createOutputConfiguration(config, target, packageName));
+                    LogUtil.log("【CS】OutputConfig 替换主预览 Surface -> " + target + ": " + originalSurface);
+                } else if (isYuv && originalSurface != null) {
+                    Surface vSurface = assignYuvTarget(originalSurface, virtualIndex++);
+                    rememberReaderPlaybackSurface(originalSurface);
+                    sessionKeptYuvSurfaces.add(originalSurface);
                     rewritten.add(createOutputConfiguration(config, vSurface, packageName));
-                    LogUtil.log("【CS】OutputConfig 替换主预览 Surface -> virtual[0]: " + originalSurface);
-                } else if (isYuv) {
-                    Surface vSurface = createVirtualSurface(virtualIndex++);
-                    if (originalSurface != null) {
-                        originalToVirtualMap.put(originalSurface, vSurface);
-                        long handle = getSurfaceNativeHandle(originalSurface);
-                        if (handle != 0L) originalNativeToVirtualMap.put(handle, vSurface);
-                        rememberReaderPlaybackSurface(originalSurface);
-                        sessionKeptYuvSurfaces.add(originalSurface);
-                    }
-                    rewritten.add(createOutputConfiguration(config, vSurface, packageName));
-                    LogUtil.log("【CS】OutputConfig [方案一替身置换] 替换 YUV Reader Surface -> virtual[" + (virtualIndex - 1) + "]: " + originalSurface);
+                    LogUtil.log("【CS】OutputConfig [方案一替身置换] 替换 YUV Reader Surface -> " + vSurface + ": " + originalSurface);
+                } else if (findPreview(originalSurface) != null) {
+                    rewritten.add(createOutputConfiguration(config, assignBridgedTarget(originalSurface), packageName));
+                    LogUtil.log("【CS】OutputConfig 复用已建立的预览桥接: " + originalSurface);
                 } else {
                     rewritten.add(createOutputConfiguration(config, originalSurface, packageName));
                     LogUtil.log("【CS】OutputConfig 保留真实辅助/JPEG Surface: " + originalSurface);
@@ -1317,7 +1596,7 @@ public final class Camera2SessionHook {
     }
 
     public void updateImageReaderListener(Object imageReaderObj, Object listenerObj, Handler handler) {
-        if (!(imageReaderObj instanceof ImageReader)) {
+        if (!(imageReaderObj instanceof ImageReader) || shouldSkipImageReaderTracking()) {
             return;
         }
         ImageReader imageReader = (ImageReader) imageReaderObj;
@@ -1429,7 +1708,7 @@ public final class Camera2SessionHook {
      * 避免阻塞 WhatsApp UI 处理和挂断信号。
      */
     private void preRefreshYuvCache(YuvCallbackPump pump) {
-        if (isReleasing || pump == null || !pump.running) {
+        if (isReleasing || pump == null || !pump.running || SwitchablePreview.useOriginalCamera()) {
             return;
         }
         if (!shouldDriveYuvBridgeNow()) {
@@ -1477,6 +1756,10 @@ public final class Camera2SessionHook {
 
     private void dispatchWhatsAppYuvCallback(YuvCallbackPump pump) {
         if (pump == null || !pump.running || pump.listener == null || isReleasing) {
+            return;
+        }
+        // Forwarded real frames trigger the reader's own callbacks in original mode.
+        if (SwitchablePreview.useOriginalCamera()) {
             return;
         }
         if (!shouldDriveYuvBridgeNow()) {
@@ -2511,6 +2794,10 @@ public final class Camera2SessionHook {
         if (targetSurface == null || !targetSurface.isValid() || Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
             return false;
         }
+        // Real frames are forwarded by YuvSourceRelay while the original camera is selected.
+        if (SwitchablePreview.useOriginalCamera()) {
+            return false;
+        }
         MediaCodecYuvDecoder dec = yuvDecoder;
         if (dec == null) {
             return false;
@@ -2521,24 +2808,23 @@ public final class Camera2SessionHook {
         }
 
         try {
-            ImageWriter writer = imageWriterMap.get(targetSurface);
-            if (writer == null) {
-                writer = ImageWriter.newInstance(targetSurface, 2);
-                imageWriterMap.put(targetSurface, writer);
-            }
-            Image image = writer.dequeueInputImage();
-            if (image == null) {
-                return false;
-            }
+            ImageWriter writer = obtainImageWriter(targetSurface);
+            // The writer is shared with YuvSourceRelay, which runs on another thread.
+            synchronized (writer) {
+                Image image = writer.dequeueInputImage();
+                if (image == null) {
+                    return false;
+                }
 
-            try {
-                copyYuvFrameToImageWithStride(yuv, image);
-                image.setTimestamp(getNextMonotonicPtsNs());
-                writer.queueInputImage(image);
-                return true;
-            } catch (Throwable t) {
-                try { image.close(); } catch (Throwable ignored) {}
-                LogUtil.log("【CS】YUV 跨距对齐写入异常: " + t.getMessage());
+                try {
+                    copyYuvFrameToImageWithStride(yuv, image);
+                    image.setTimestamp(getNextMonotonicPtsNs());
+                    writer.queueInputImage(image);
+                    return true;
+                } catch (Throwable t) {
+                    try { image.close(); } catch (Throwable ignored) {}
+                    LogUtil.log("【CS】YUV 跨距对齐写入异常: " + t.getMessage());
+                }
             }
         } catch (Throwable t) {
             LogUtil.log("【CS】Direct YUV 泵送异常: " + t.getMessage());

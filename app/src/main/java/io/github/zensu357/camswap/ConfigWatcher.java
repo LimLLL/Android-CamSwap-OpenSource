@@ -9,6 +9,13 @@ import android.os.FileObserver;
 import android.os.Handler;
 import android.os.Looper;
 
+import org.json.JSONObject;
+
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.Set;
+
 import io.github.zensu357.camswap.utils.LogUtil;
 import io.github.zensu357.camswap.utils.VideoManager;
 
@@ -26,10 +33,21 @@ public final class ConfigWatcher {
         void onCameraSourceChanged();
     }
 
+    /** Keys applied live by the callbacks; changing only these must not restart playback. */
+    private static final Set<String> LIVE_KEYS = new HashSet<>(Arrays.asList(
+            ConfigManager.KEY_VIDEO_ROTATION_OFFSET, ConfigManager.KEY_USE_ORIGINAL_CAMERA));
+    /**
+     * Every save notifies both the provider observer and the broadcast receiver. If the
+     * broadcast already applied a change, an observer call within this window that finds
+     * nothing new is that same save and must not restart playback.
+     */
+    private static final long DUPLICATE_NOTIFY_WINDOW_NS = 2_000_000_000L;
+
     private final Callback callback;
     private android.database.ContentObserver configObserver;
     private FileObserver configFileObserver;
     private boolean lastOriginalCamera;
+    private long lastBroadcastChangeNs;
 
     public ConfigWatcher(Callback callback) {
         this.callback = callback;
@@ -50,10 +68,7 @@ public final class ConfigWatcher {
             public void onChange(boolean selfChange) {
                 super.onChange(selfChange);
                 LogUtil.log("【CS】Provider 配置变更");
-                VideoManager.getConfig().forceReload();
-                notifyCameraSourceChanged();
-                VideoManager.updateVideoPath(false);
-                callback.onMediaSourceChanged();
+                reloadStoredConfig();
             }
         };
 
@@ -76,12 +91,8 @@ public final class ConfigWatcher {
                     public void onEvent(int event, String path) {
                         if (path != null && path.endsWith(".json")) {
                             LogUtil.log("【CS】文件变更: " + path);
-                            new Handler(Looper.getMainLooper()).postDelayed(() -> {
-                                VideoManager.getConfig().forceReload();
-                                notifyCameraSourceChanged();
-                                VideoManager.updateVideoPath(false);
-                                callback.onMediaSourceChanged();
-                            }, 200);
+                            new Handler(Looper.getMainLooper()).postDelayed(
+                                    ConfigWatcher.this::reloadStoredConfig, 200);
                         }
                     }
                 };
@@ -124,11 +135,58 @@ public final class ConfigWatcher {
         }
     }
 
+    /**
+     * Provider/file notification path. Unlike the broadcast it carries no diff, so any change
+     * outside {@link #LIVE_KEYS} (or an explicit re-save) restarts playback as before.
+     */
+    private void reloadStoredConfig() {
+        ConfigManager config = VideoManager.getConfig();
+        JSONObject before = config.getConfigData();
+        config.forceReload();
+        JSONObject after = config.getConfigData();
+        notifyCameraSourceChanged();
+        Set<String> changed = changedKeys(before, after);
+        if (changed.contains(ConfigManager.KEY_VIDEO_ROTATION_OFFSET)) {
+            int rotation = after.optInt(ConfigManager.KEY_VIDEO_ROTATION_OFFSET, 0);
+            LogUtil.log("【CS】Provider 配置更新: 旋转 " + rotation + "°");
+            callback.onRotationChanged(rotation);
+        }
+        if (!changed.isEmpty() && LIVE_KEYS.containsAll(changed)) {
+            LogUtil.log("【CS】Provider 配置更新: 仅实时项变化 " + changed + "，不重启播放器");
+            return;
+        }
+        if (changed.isEmpty() && lastBroadcastChangeNs != 0L
+                && System.nanoTime() - lastBroadcastChangeNs < DUPLICATE_NOTIFY_WINDOW_NS) {
+            LogUtil.log("【CS】Provider 配置更新: 已由广播处理");
+            return;
+        }
+        VideoManager.updateVideoPath(false);
+        callback.onMediaSourceChanged();
+    }
+
+    private static Set<String> changedKeys(JSONObject before, JSONObject after) {
+        Set<String> keys = new HashSet<>();
+        for (Iterator<String> it = before.keys(); it.hasNext();) {
+            keys.add(it.next());
+        }
+        for (Iterator<String> it = after.keys(); it.hasNext();) {
+            keys.add(it.next());
+        }
+        Set<String> changed = new HashSet<>();
+        for (String key : keys) {
+            if (!String.valueOf(before.opt(key)).equals(String.valueOf(after.opt(key)))) {
+                changed.add(key);
+            }
+        }
+        return changed;
+    }
+
     private void handleConfigUpdate(Intent intent) {
         ConfigManager config = VideoManager.getConfig();
         String configJson = intent.getStringExtra(IpcContract.EXTRA_CONFIG_JSON);
         if (configJson == null)
             return;
+        JSONObject before = config.getConfigData();
 
         // Snapshot old values
         String oldVideo = config.getString(ConfigManager.KEY_SELECTED_VIDEO, "");
@@ -141,6 +199,9 @@ public final class ConfigWatcher {
         String oldStreamUrl = config.getString(ConfigManager.KEY_STREAM_URL, "");
 
         config.updateConfigFromJSON(configJson);
+        if (!changedKeys(before, config.getConfigData()).isEmpty()) {
+            lastBroadcastChangeNs = System.nanoTime();
+        }
         notifyCameraSourceChanged();
 
         // Snapshot new values
@@ -169,11 +230,14 @@ public final class ConfigWatcher {
             VideoManager.updateVideoPath(false);
             callback.onMediaSourceChanged();
             LogUtil.log("【CS】配置更新: 媒体源变化，重启播放器");
-        } else if (oldRotation != newRotation) {
+        }
+        // Independent of the media restart, which does not touch renderer rotation.
+        if (oldRotation != newRotation) {
             LogUtil.log("【CS】配置更新: 旋转 " + newRotation + "°");
             callback.onRotationChanged(newRotation);
-        } else {
-            LogUtil.log("【CS】配置更新: 无变化");
+        }
+        if (!mediaChanged && oldRotation == newRotation) {
+            LogUtil.log("【CS】配置更新: 无媒体/旋转变化");
         }
     }
 

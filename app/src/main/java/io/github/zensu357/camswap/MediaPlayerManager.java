@@ -398,11 +398,22 @@ public final class MediaPlayerManager {
     }
 
     /**
-     * 旋转偏移已更新的通知。渲染器保持 0° 旋转（应用自行处理预览旋转），
-     * rotation_offset 仅在 captureFrameForYuv 中应用于 YUV 截帧/JPEG。
+     * 将新的旋转偏移实时应用到所有活跃的渲染器，与创建渲染器时读取配置的效果一致；
+     * YUV 截帧路径在每次截帧时自行读取配置。
      */
     void updateRotation(int degrees) {
-        LogUtil.log("【CS】旋转偏移已更新: " + degrees + "°（渲染器保持0°，仅影响截帧）");
+        for (GLVideoRenderer renderer : new GLVideoRenderer[] { c1_renderer_holder, c1_renderer_texture,
+                c2_renderer, c2_renderer_1, c2_reader_renderer, c2_reader_renderer_1 }) {
+            if (renderer != null) {
+                renderer.setRotation(degrees);
+            }
+        }
+        for (SurfaceRelay relay : new SurfaceRelay[] { c2_relay, c2_relay_1, c2_reader_relay, c2_reader_relay_1 }) {
+            if (relay != null) {
+                relay.setRotation(degrees);
+            }
+        }
+        LogUtil.log("【CS】旋转偏移已实时应用: " + degrees + "°");
     }
 
     /** Release all GL renderers. */
@@ -495,9 +506,8 @@ public final class MediaPlayerManager {
             player.setVolume(0, 0);
         player.setLooping(true);
         try {
-            // 预览渲染器旋转固定为 0°：应用（如 WhatsApp、LINE）会对预览自行应用相机传感器旋转，
-            // CamSwap 不应再叠加旋转，否则本机画面会被双重旋转。
-            // video_rotation_offset 仅在 YUV 截帧时通过 captureFrameForYuv 应用，确保对方画面正确。
+            // 渲染器使用用户配置的 video_rotation_offset（默认 0°，不叠加传感器旋转，应用会自行处理），
+            // 之后的修改由 updateRotation 实时同步。
             int rotation = VideoManager.getConfig().getInt(ConfigManager.KEY_VIDEO_ROTATION_OFFSET, 0);
             rendererRef[0] = GLVideoRenderer.createSafely(targetSurface, tag);
             if (rendererRef[0] != null) {
